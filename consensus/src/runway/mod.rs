@@ -649,23 +649,21 @@ where
     }
 
     fn on_ordered_batch(&mut self, batch: Vec<H::Hash>) {
-        let data_iter: Vec<_> = batch
+        let unit_iter = batch
             .iter()
             .map(|h| {
-                let unit = self
-                    .store
+                self.store
                     .unit_by_hash(h)
                     .expect("Ordered units must be in store")
-                    .as_signable();
+                    .as_signable()
+            });
 
-                (unit.data().clone(), unit.creator())
-            })
-            .collect();
-
-        for (d, creator) in data_iter {
-            if let Some(d) = d {
-                self.finalization_handler.data_finalized(d, creator);
-            }
+        for unit in unit_iter {
+            self.finalization_handler.unit_finalized(
+                unit.creator(),
+                unit.round(),
+                unit.data().clone(),
+            )
         }
     }
 
