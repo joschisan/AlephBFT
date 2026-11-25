@@ -945,6 +945,7 @@ pub(crate) async fn run<H, D, US, UL, MK, DP, FH, SH>(
             backup_units_from_runway,
             backup_units_for_runway,
             runway_io.backup_write,
+            keychain.index(),
         );
         async move {
             backup_saver.run(backup_saver_terminator).await;
