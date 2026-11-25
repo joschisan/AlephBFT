@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::{units::UncheckedSignedUnit, Data, Hasher, Receiver, Sender, Signature, Terminator};
+use crate::{
+    units::UncheckedSignedUnit, Data, Hasher, NodeIndex, Receiver, Sender, Signature, Terminator,
+};
 use codec::Encode;
 use futures::{AsyncWrite, AsyncWriteExt, FutureExt, StreamExt};
 use log::{debug, error};
@@ -11,12 +13,19 @@ const LOG_TARGET: &str = "AlephBFT-backup-saver";
 /// Write backups to peristent storage.
 pub trait BackupWriter {
     /// Append new data to the backup.
-    async fn append(&mut self, data: &[u8]) -> std::io::Result<()>;
+    ///
+    /// `flush` is set for our own units, which must be persisted, together
+    /// with everything appended before them, before this returns: we
+    /// broadcast them once it does, and forgetting one after a crash could
+    /// make us sign a second unit for its round. Units of other nodes may be
+    /// buffered until the next flush, since no node can tell whether we stored
+    /// them before we broadcast a unit of our own on top of them.
+    async fn append(&mut self, data: &[u8], flush: bool) -> std::io::Result<()>;
 }
 
 #[async_trait]
 impl<W: AsyncWrite + Send + Unpin> BackupWriter for W {
-    async fn append(&mut self, data: &[u8]) -> std::io::Result<()> {
+    async fn append(&mut self, data: &[u8], _flush: bool) -> std::io::Result<()> {
         self.write_all(data).await?;
         self.flush().await
     }
@@ -29,6 +38,7 @@ pub struct BackupSaver<H: Hasher, D: Data, S: Signature, W: BackupWriter> {
     units_from_runway: Receiver<UncheckedSignedUnit<H, D, S>>,
     responses_for_runway: Sender<UncheckedSignedUnit<H, D, S>>,
     backup: W,
+    index: NodeIndex,
 }
 
 impl<H: Hasher, D: Data, S: Signature, W: BackupWriter> BackupSaver<H, D, S, W> {
@@ -36,11 +46,13 @@ impl<H: Hasher, D: Data, S: Signature, W: BackupWriter> BackupSaver<H, D, S, W> 
         units_from_runway: Receiver<UncheckedSignedUnit<H, D, S>>,
         responses_for_runway: Sender<UncheckedSignedUnit<H, D, S>>,
         backup: W,
+        index: NodeIndex,
     ) -> BackupSaver<H, D, S, W> {
         BackupSaver {
             units_from_runway,
             responses_for_runway,
             backup,
+            index,
         }
     }
 
@@ -48,7 +60,8 @@ impl<H: Hasher, D: Data, S: Signature, W: BackupWriter> BackupSaver<H, D, S, W> 
         &mut self,
         item: &UncheckedSignedUnit<H, D, S>,
     ) -> Result<(), std::io::Error> {
-        self.backup.append(&item.encode()).await
+        let flush = item.as_signable().creator() == self.index;
+        self.backup.append(&item.encode(), flush).await
     }
 
     pub async fn run(&mut self, mut terminator: Terminator) {
@@ -119,7 +132,7 @@ mod tests {
 
         let task = {
             let mut saver: TestBackupSaver =
-                BackupSaver::new(units_from_runway, units_for_runway, backup);
+                BackupSaver::new(units_from_runway, units_for_runway, backup, NodeIndex(0));
 
             async move {
                 saver.run(Terminator::create_root(exit_rx, "saver")).await;
@@ -169,6 +182,56 @@ mod tests {
             let u_backup = units_from_saver.next().await.unwrap();
             assert_eq!(u, u_backup);
         }
+
+        exit_tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Records the `flush` flag of every append.
+    #[derive(Clone, Default)]
+    struct FlushRecorder(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+    #[async_trait::async_trait]
+    impl super::BackupWriter for FlushRecorder {
+        async fn append(&mut self, _data: &[u8], flush: bool) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(flush);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn only_own_units_are_flushed() {
+        let n_members = NodeCount(5);
+        let own_index = NodeIndex(2);
+        let (units_for_saver, units_from_runway) = mpsc::unbounded();
+        let (units_for_runway, mut units_from_saver) = mpsc::unbounded();
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let recorder = FlushRecorder::default();
+        let mut saver: BackupSaver<Hasher64, Data, Signature, FlushRecorder> = BackupSaver::new(
+            units_from_runway,
+            units_for_runway,
+            recorder.clone(),
+            own_index,
+        );
+        let handle = tokio::spawn(async move {
+            saver.run(Terminator::create_root(exit_rx, "saver")).await;
+        });
+
+        let creators = creator_set(n_members);
+        for (k, creator) in creators.iter().enumerate() {
+            let keychain = Keychain::new(n_members, NodeIndex(k));
+            let unit =
+                preunit_to_unchecked_signed_unit(creator.create_unit(0).unwrap().0, 0, &keychain);
+            units_for_saver.unbounded_send(unit).unwrap();
+        }
+        for _ in 0..n_members.0 {
+            units_from_saver.next().await.unwrap();
+        }
+
+        let expected: Vec<bool> = (0..n_members.0)
+            .map(|k| NodeIndex(k) == own_index)
+            .collect();
+        assert_eq!(*recorder.0.lock().unwrap(), expected);
 
         exit_tx.send(()).unwrap();
         handle.await.unwrap();
