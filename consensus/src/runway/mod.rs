@@ -142,6 +142,9 @@ where
     backup_units_from_saver: Receiver<UncheckedSignedUnit<H, D, MK::Signature>>,
     preunits_for_packer: Sender<PreUnit<H>>,
     signed_units_from_packer: Receiver<SignedUnit<H, D, MK>>,
+    /// Units loaded from our backup that have not reached the DAG yet. They
+    /// are already in the backup, so they skip the saver once they do.
+    replayed_units: HashSet<H::Hash>,
     exiting: bool,
 }
 
@@ -304,6 +307,7 @@ where
             responses_for_collection,
             preunits_for_packer,
             signed_units_from_packer,
+            replayed_units: HashSet::new(),
             exiting: false,
         }
     }
@@ -598,7 +602,13 @@ where
                 self.store.add_parents(h, p_hashes);
                 self.resolve_missing_parents(&h);
                 if let Some(su) = self.store.unit_by_hash(&h).cloned() {
-                    if self
+                    if self.replayed_units.remove(&h) {
+                        // Saving it again would append a second copy to the
+                        // backup. It still needs what a save triggers, most
+                        // importantly broadcasting our own unit, which we may
+                        // have saved but never sent before going down.
+                        self.on_unit_backup_saved(su.into());
+                    } else if self
                         .backup_units_for_saver
                         .unbounded_send(su.into())
                         .is_err()
@@ -725,6 +735,7 @@ where
         match data_from_backup.await {
             Ok(units) => {
                 for unit in units {
+                    self.replayed_units.insert(unit.as_signable().hash());
                     self.on_unit_received(unit, false);
                 }
             }

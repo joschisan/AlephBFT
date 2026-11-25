@@ -139,7 +139,10 @@ fn verify_backup(buf: &mut &[u8]) -> HashSet<UnitCoord> {
             assert!(already_saved.contains(&parent));
         }
 
-        already_saved.insert(coord);
+        assert!(
+            already_saved.insert(coord),
+            "unit {coord:?} is saved more than once"
+        );
     }
 
     already_saved

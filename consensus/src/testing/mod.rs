@@ -82,8 +82,11 @@ pub fn spawn_honest_member(
     let config = gen_config(node_index, n_members, gen_delay_config());
     let (exit_tx, exit_rx) = oneshot::channel();
     let spawner_inner = spawner;
+    // The saver appends to the backup the loader reads, like a persistent
+    // backup does, since a restarted node does not save the units it loaded
+    // again.
+    let saved_state = Arc::new(Mutex::new(units.clone()));
     let unit_loader = Loader::new(units);
-    let saved_state = Arc::new(Mutex::new(vec![]));
     let unit_saver: Saver = saved_state.clone().into();
     let local_io = LocalIO::new(data_provider, finalization_handler, unit_saver, unit_loader);
     let member_task = async move {
